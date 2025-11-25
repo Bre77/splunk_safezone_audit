@@ -70,62 +70,74 @@ def get_data_from_api(
     total_records = 0
 
     with requests.Session() as session:
-        # Add authentication if needed
+        # Add authentication
         if config.get("username") and config.get("password"):
             session.auth = (config["username"], config["password"])
 
         logger.info(f"Fetching safezones from {start_date} to {end_date}")
 
-        ids = session.get(
-            f"https://{config['customername']}.criticalarc.net/api/safezones",
+        # Get safezones list
+        safezones_url = (
+            f"https://{config['customername']}.criticalarc.net/api/safezones"
         )
+
+        ids = session.get(safezones_url)
         ids.raise_for_status()
 
-        # Parse XML
+        # Parse XML with namespace handling
         xml_data = ET.fromstring(ids.content)
-        # Handle XML namespace
         namespace = {"ns": "urn:criticalarc:x:safezone"}
-        safezones = xml_data.findall(".//ns:safezone", namespace)
+        safezones = xml_data.findall("ns:safezone", namespace)
 
-        # If no safezones found with namespace, try without namespace
+        # Fallback to non-namespaced query if needed
         if len(safezones) == 0:
             safezones = xml_data.findall("safezone")
 
         logger.info(f"Found {len(safezones)} safezones to process")
 
         for safezone in safezones:
-            safezone_id = safezone.attrib["id"]
-            logger.debug(f"Processing safezone ID: {safezone_id}")
+            safezone_id = safezone.attrib.get("id", "unknown")
+            logger.debug(f"Processing safezone: {safezone_id}")
 
-            # Use checkpoint-controlled date range
-            audit = session.get(
-                f"https://{config['customername']}.criticalarc.net/api/audit/{safezone_id}/records",
-                params={
-                    "from": start_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                    "to": end_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                },
-            )
+            # Format dates for API
+            from_param = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            to_param = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # Get audit records
+            audit_url = f"https://{config['customername']}.criticalarc.net/api/audit/{safezone_id}/records"
+            audit_params = {"from": from_param, "to": to_param}
+
+            audit = session.get(audit_url, params=audit_params)
             audit.raise_for_status()
+
+            # Parse audit XML with namespace handling
             audit_data = ET.fromstring(audit.content)
-            records = audit_data.findall("record")
+            audit_namespace = {"ns": "urn:intrinsic:x:auditing"}
+            records = audit_data.findall("ns:record", audit_namespace)
+
+            # Fallback to non-namespaced query if needed
+            if len(records) == 0:
+                records = audit_data.findall("record")
 
             logger.info(f"Found {len(records)} records for safezone {safezone_id}")
             total_records += len(records)
 
             for record in records:
-                # Extract metadata
-                timestamp = record.attrib.get("timestamp")
-
-                # Convert XML element to dictionary for JSON serialization (data only)
+                # Convert XML element to dictionary
                 record_dict = {
+                    "safezone_id": safezone_id,
                     "record_id": record.attrib.get("id"),
-                    "type": record.attrib.get("type"),
-                    "service": record.attrib.get("service"),
+                    "timestamp": record.attrib.get("timestamp"),
                 }
 
-                # Add all child elements as fields, stripping namespace prefixes
+                # Add all record attributes except 'id' (already captured as record_id)
+                for attr, value in record.attrib.items():
+                    if attr not in ["id"]:
+                        record_dict[attr] = value
+
+                # Process child elements
                 for child in record:
-                    # Remove namespace from tag name
+                    # Remove namespace from tag name if present
                     tag_name = (
                         child.tag.split("}")[-1] if "}" in child.tag else child.tag
                     )
@@ -141,7 +153,7 @@ def get_data_from_api(
                             param_type = param.attrib.get("type")
                             value = param.text
 
-                            # Create a unique key for this parameter
+                            # Create unique key for parameter
                             if tag_id:
                                 key = f"{name}_{tag_id}" if name else tag_id
                             else:
@@ -164,9 +176,7 @@ def get_data_from_api(
                     else:
                         record_dict[tag_name] = child.text
 
-                # Structure as requested: time, source, data
-                event = {"time": timestamp, "source": safezone_id, "data": record_dict}
-                events.append(event)
+                events.append(record_dict)
 
         logger.info(f"Total records processed: {total_records}")
         return events
@@ -187,21 +197,9 @@ def stream_events(inputs: smi.InputDefinition, event_writer: smi.EventWriter):
             app=ADDON_NAME,
         )
     except Exception as e:
-        # Fallback to a generic logger if input-specific logger isn't available yet
         logging.error(f"Failed to initialize KVStore checkpointer: {e}")
         return
 
-    # inputs.inputs is a Python dictionary object like:
-    # {
-    #   "safezone_audit://<input_name>": {
-    #     "account": "<account_name>",
-    #     "disabled": "0",
-    #     "host": "$decideOnStartup",
-    #     "index": "<index_name>",
-    #     "interval": "<interval_value>",
-    #     "python.version": "python3",
-    #   },
-    # }
     for input_name, input_item in inputs.inputs.items():
         normalized_input_name = input_name.split("/")[-1]
         logger = logger_for_input(normalized_input_name)
@@ -222,7 +220,7 @@ def stream_events(inputs: smi.InputDefinition, event_writer: smi.EventWriter):
             # Get checkpoint key and determine date range for this run
             checkpoint_key = get_checkpoint_key(normalized_input_name, account_name)
             start_date = get_last_end_date(ckpt, checkpoint_key)
-            end_date = datetime.utcnow()  # Always use current time as end date
+            end_date = datetime.utcnow()
 
             logger.info(f"Processing data from {start_date} to {end_date}")
 
@@ -231,32 +229,29 @@ def stream_events(inputs: smi.InputDefinition, event_writer: smi.EventWriter):
             source = f"{config['customername']}.criticalarc.net/api/audit"
 
             events_written = 0
-            for event in data:
-                # Use timestamp from event if available, otherwise use current time
+            for record in data:
+                # Use timestamp from record if available
                 event_time = None
-                if event.get("time"):
+                if record.get("timestamp"):
                     try:
                         event_time = datetime.fromisoformat(
-                            event["time"].replace("Z", "+00:00")
+                            record["timestamp"].replace("Z", "+00:00")
                         ).timestamp()
                     except (ValueError, AttributeError):
                         pass
 
-                # Use safezone_id as source if available, otherwise use default
-                event_source = event.get("source", source)
-
                 event_writer.write_event(
                     smi.Event(
                         time=event_time,
-                        data=json.dumps(event["data"], ensure_ascii=False, default=str),
+                        data=json.dumps(record, ensure_ascii=False, default=str),
                         index=input_item.get("index"),
                         sourcetype=sourcetype,
-                        source=event_source,
+                        source=source,
                     )
                 )
                 events_written += 1
 
-            # Save checkpoint with this run's end date (which becomes next run's start date)
+            # Save checkpoint with this run's end date
             save_checkpoint(ckpt, checkpoint_key, end_date)
             logger.info(f"Updated checkpoint with end date: {end_date}")
 

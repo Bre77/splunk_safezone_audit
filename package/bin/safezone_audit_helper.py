@@ -2,7 +2,6 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-import import_declare_test
 import requests
 from solnlib import conf_manager, log
 from solnlib.modular_input import checkpointer
@@ -123,16 +122,17 @@ def get_data_from_api(
             total_records += len(records)
 
             for record in records:
-                # Convert XML element to dictionary
+                # Extract timestamp and safezone_id for separate fields
+                timestamp = record.attrib.get("timestamp")
+
+                # Convert XML element to dictionary (excluding timestamp and id)
                 record_dict = {
-                    "safezone_id": safezone_id,
                     "record_id": record.attrib.get("id"),
-                    "timestamp": record.attrib.get("timestamp"),
                 }
 
-                # Add all record attributes except 'id' (already captured as record_id)
+                # Add all record attributes except 'id' and 'timestamp' (handled separately)
                 for attr, value in record.attrib.items():
-                    if attr not in ["id"]:
+                    if attr not in ["id", "timestamp"]:
                         record_dict[attr] = value
 
                 # Process child elements
@@ -176,7 +176,10 @@ def get_data_from_api(
                     else:
                         record_dict[tag_name] = child.text
 
-                events.append(record_dict)
+                # Create event structure with separated time, source, and data
+                event = {"time": timestamp, "source": safezone_id, "data": record_dict}
+
+                events.append(event)
 
         logger.info(f"Total records processed: {total_records}")
         return events
@@ -226,27 +229,31 @@ def stream_events(inputs: smi.InputDefinition, event_writer: smi.EventWriter):
 
             data = get_data_from_api(logger, config, start_date, end_date)
             sourcetype = "safezone:audit"
-            source = f"{config['customername']}.criticalarc.net/api/audit"
 
             events_written = 0
-            for record in data:
-                # Use timestamp from record if available
+            for event in data:
+                # Use timestamp from event if available
                 event_time = None
-                if record.get("timestamp"):
+                if event.get("time"):
                     try:
                         event_time = datetime.fromisoformat(
-                            record["timestamp"].replace("Z", "+00:00")
+                            event["time"].replace("Z", "+00:00")
                         ).timestamp()
                     except (ValueError, AttributeError):
                         pass
 
+                # Use safezone_id as source
+                event_source = event.get(
+                    "source", f"{config['customername']}.criticalarc.net/api/audit"
+                )
+
                 event_writer.write_event(
                     smi.Event(
                         time=event_time,
-                        data=json.dumps(record, ensure_ascii=False, default=str),
+                        data=json.dumps(event["data"], ensure_ascii=False, default=str),
                         index=input_item.get("index"),
                         sourcetype=sourcetype,
-                        source=source,
+                        source=event_source,
                     )
                 )
                 events_written += 1

@@ -209,7 +209,7 @@
   "meta": {
     "name": "safezone_audit",
     "restRoot": "safezone_audit",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "displayName": "SafeZone Audit",
     "schemaVersion": "0.0.10",
     "supportedThemes": ["light", "dark"]

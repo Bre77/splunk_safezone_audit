@@ -44,7 +44,8 @@
                 {
                   "type": "string",
                   "errorMsg": "Customer Name required",
-                  "minLength": 1
+                  "minLength": 1,
+                  "maxLength": 100
                 }
               ]
             },
@@ -57,7 +58,8 @@
                 {
                   "type": "string",
                   "errorMsg": "Username required",
-                  "minLength": 1
+                  "minLength": 1,
+                  "maxLength": 100
                 }
               ]
             },
@@ -65,14 +67,14 @@
               "type": "text",
               "label": "Password",
               "field": "password",
-              "help": "Password",
               "required": true,
               "encrypted": true,
               "validators": [
                 {
                   "type": "string",
                   "errorMsg": "Password required",
-                  "minLength": 1
+                  "minLength": 1,
+                  "maxLength": 256
                 }
               ]
             }
